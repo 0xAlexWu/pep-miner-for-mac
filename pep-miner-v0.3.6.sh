@@ -19,7 +19,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.2.4"
+VERSION="0.3.6"
 AUTHOR="0xAlexWu"
 X_HANDLE="@0xAlexWu"
 
@@ -32,11 +32,20 @@ MINE_LOG="$LOG_DIR/mining.log"
 POOL_HOST="${PEP_POOL_HOST:-stratum.aikapool.com}"
 POOL_PORT="${PEP_POOL_PORT:-7941}"
 
+# Runtime controls.
+# PEP_CPU_PERCENT can be set to 1-100. If omitted, the script asks interactively.
+# The percentage is translated into a practical Apple Silicon thread count.
+CPU_PERCENT="${PEP_CPU_PERCENT:-}"
+CPU_THREADS=""
+TOTAL_THREADS=""
+NICE_LEVEL="${PEP_NICE_LEVEL:-10}"
+
 # ANSI terminal colors. Set NO_COLOR=1 to disable.
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   RESET=$'\033[0m'
   BOLD=$'\033[1m'
   DIM=$'\033[2m'
+  BLACK=$'\033[30m'
   RED=$'\033[31m'
   GREEN=$'\033[32m'
   YELLOW=$'\033[33m'
@@ -44,10 +53,19 @@ if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   MAGENTA=$'\033[35m'
   CYAN=$'\033[36m'
   WHITE=$'\033[37m'
+  SILVER=$'\033[97m'
+  BG_RED=$'\033[41m'
+  BG_GREEN=$'\033[42m'
+  BG_YELLOW=$'\033[43m'
+  BG_BLUE=$'\033[44m'
+  BG_MAGENTA=$'\033[45m'
+  BG_CYAN=$'\033[46m'
+  BG_ORANGE=$'\033[48;5;208m'
 else
   RESET=""
   BOLD=""
   DIM=""
+  BLACK=""
   RED=""
   GREEN=""
   YELLOW=""
@@ -55,6 +73,13 @@ else
   MAGENTA=""
   CYAN=""
   WHITE=""
+  BG_RED=""
+  BG_GREEN=""
+  BG_YELLOW=""
+  BG_BLUE=""
+  BG_MAGENTA=""
+  BG_CYAN=""
+  BG_ORANGE=""
 fi
 
 mkdir -p "$LOG_DIR"
@@ -122,6 +147,169 @@ kv() {
   printf "%b* %-10s%b %s\n" "$GREEN" "$label" "$RESET" "$*"
 }
 
+
+badge() {
+  local bg="$1"
+  local label="$2"
+  local padded
+
+  # Fixed-width XMRig-style tag with bright silver/white text.
+  printf -v padded "%-8s" "$label"
+  printf "%b %s %b" "${BOLD}${SILVER}${bg}" "$padded" "$RESET"
+}
+
+highlight_metrics() {
+  local s="$1"
+
+  # Hashrate lines.
+  if [[ "$s" =~ ^(Total:[[:space:]]*)([0-9.]+[[:space:]]*[kKmMgGtTpP]?[hH]/s)(.*)$ ]]; then
+    printf "%s%b%s%b%s" \
+      "${BASH_REMATCH[1]}" "$BOLD$GREEN" "${BASH_REMATCH[2]}" "$RESET" "${BASH_REMATCH[3]}"
+    return
+  fi
+
+  if [[ "$s" =~ ^(Benchmark:[[:space:]]*)([0-9.]+[[:space:]]*[kKmMgGtTpP]?[hH]/s)(.*)$ ]]; then
+    printf "%s%b%s%b%s" \
+      "${BASH_REMATCH[1]}" "$BOLD$GREEN" "${BASH_REMATCH[2]}" "$RESET" "${BASH_REMATCH[3]}"
+    return
+  fi
+
+  # TTF line: highlight current hashrate and the share estimate.
+  if [[ "$s" =~ ^([[:space:]]*TTF[[:space:]]+@[[:space:]]+)([^:]+)(:[[:space:]]+Block[[:space:]]+[^,]+,[[:space:]]+Share[[:space:]]+)([^[:space:]]+)(.*)$ ]]; then
+    printf "%s%b%s%b%s%b%s%b%s" \
+      "${BASH_REMATCH[1]}" "$BOLD$CYAN" "${BASH_REMATCH[2]}" "$RESET" \
+      "${BASH_REMATCH[3]}" "$BOLD$YELLOW" "${BASH_REMATCH[4]}" "$RESET" "${BASH_REMATCH[5]}"
+    return
+  fi
+
+  # Difficulty summary.
+  if [[ "$s" =~ ^([[:space:]]*Diff:[[:space:]]+Net[[:space:]]+)([^,]+)(,[[:space:]]+Stratum[[:space:]]+)([^,]+)(,[[:space:]]+Target[[:space:]]+)(.*)$ ]]; then
+    printf "%s%b%s%b%s%b%s%b%s%s" \
+      "${BASH_REMATCH[1]}" "$BOLD$CYAN" "${BASH_REMATCH[2]}" "$RESET" \
+      "${BASH_REMATCH[3]}" "$BOLD$YELLOW" "${BASH_REMATCH[4]}" "$RESET" \
+      "${BASH_REMATCH[5]}" "${BASH_REMATCH[6]}"
+    return
+  fi
+
+  # Estimated network hashrate.
+  if [[ "$s" =~ ^([[:space:]]*Net[[:space:]]+hash[[:space:]]+rate[[:space:]]+\(est\)[[:space:]]+)(.*)$ ]]; then
+    printf "%s%b%s%b" "${BASH_REMATCH[1]}" "$BOLD$CYAN" "${BASH_REMATCH[2]}" "$RESET"
+    return
+  fi
+
+  # Submitted / Accepted counters.
+  if [[ "$s" =~ ^(.*Submitted[[:space:]]+)([0-9]+)(.*Accepted[[:space:]]+)([0-9]+)(.*)$ ]]; then
+    printf "%s%b%s%b%s%b%s%b%s" \
+      "${BASH_REMATCH[1]}" "$BOLD$CYAN" "${BASH_REMATCH[2]}" "$RESET" \
+      "${BASH_REMATCH[3]}" "$BOLD$GREEN" "${BASH_REMATCH[4]}" "$RESET" "${BASH_REMATCH[5]}"
+    return
+  fi
+
+  printf "%s" "$s"
+}
+
+decorate_miner_output() {
+  local line ts rest mark rendered last_ts=""
+
+  while IFS= read -r line; do
+    ts=""
+    rest="$line"
+    mark=""
+
+    if [[ "$line" =~ ^(\[[^]]+\])([[:space:]]*)(.*)$ ]]; then
+      # Store the timestamp without trailing spaces so spacing is fully
+      # controlled by Pep Miner rather than cpuminer's original formatting.
+      ts="${BASH_REMATCH[1]}"
+      rest="${BASH_REMATCH[3]}"
+      last_ts="$ts"
+    else
+      # cpuminer prints Diff / TTF / network hashrate as indented continuation
+      # lines. Reuse the preceding timestamp and strip the original indentation.
+      case "$rest" in
+        *"Diff: Net "*|*"TTF @"*|*"Net hash rate (est)"*)
+          [[ -n "$last_ts" ]] && ts="$last_ts"
+          rest="${rest#"${rest%%[![:space:]]*}"}"
+          ;;
+      esac
+    fi
+
+    case "$rest" in
+      "CPU affinity"*)
+        mark="$(badge "$BG_MAGENTA" "AFFINITY")"
+        ;;
+      "Stratum connect "*)
+        mark="$(badge "$BG_BLUE" "CONNECT")"
+        ;;
+      "Stratum connection established"*)
+        mark="$(badge "$BG_GREEN" "ONLINE")"
+        ;;
+      "Stratum extranonce1 "*)
+        mark="$(badge "$BG_CYAN" "SESSION")"
+        ;;
+      "New Stratum Diff "*)
+        mark="$(badge "$BG_YELLOW" "DIFF")"
+        ;;
+      "New Block "*|*"New Block "*)
+        mark="$(badge "$BG_CYAN" "BLOCK")"
+        ;;
+      "New Work:"*|*"New Work:"*)
+        mark="$(badge "$BG_BLUE" "WORK")"
+        ;;
+      *" miner threads started using "*)
+        mark="$(badge "$BG_GREEN" "THREADS")"
+        ;;
+      "accepted"*|"Accepted "*|*" accepted:"*)
+        mark="$(badge "$BG_GREEN" "SHARE")"
+        ;;
+      "rejected"*|"Rejected "*|*" rejected:"*)
+        mark="$(badge "$BG_RED" "REJECT")"
+        ;;
+      "stratum_recv_line failed"*|"Stratum connection reset"*|"Stratum disconnect"*|"HTTP request failed"*)
+        mark="$(badge "$BG_RED" "ERROR")"
+        ;;
+      "Periodic Report "*)
+        mark="$(badge "$BG_YELLOW" "REPORT")"
+        ;;
+      "Benchmark:"*)
+        mark="$(badge "$BG_CYAN" "BENCH")"
+        ;;
+      "Total:"*)
+        mark="$(badge "$BG_MAGENTA" "HASH")"
+        ;;
+      "TTF @"*)
+        mark="$(badge "$BG_ORANGE" "TTF")"
+        ;;
+      "Diff: Net "*)
+        mark="$(badge "$BG_YELLOW" "TARGET")"
+        ;;
+      "Net hash rate (est)"*)
+        mark="$(badge "$BG_BLUE" "NETWORK")"
+        ;;
+      *"Submitted "*"Accepted "*)
+        mark="$(badge "$BG_GREEN" "STATS")"
+        ;;
+    esac
+
+    rendered="$(highlight_metrics "$rest")"
+
+    if [[ -n "$mark" ]]; then
+      if [[ -n "$ts" ]]; then
+        # Consistent visual rhythm:
+        # [timestamp]  [BADGE   ] message
+        printf "%s  %s %s\n" "$ts" "$mark" "$rendered"
+      else
+        printf "  %s %s\n" "$mark" "$rendered"
+      fi
+    else
+      if [[ -n "$ts" ]]; then
+        printf "%s  %s\n" "$ts" "$rendered"
+      else
+        printf "%s\n" "$rendered"
+      fi
+    fi
+  done
+}
+
 on_error() {
   local exit_code=$?
   local line_no=${1:-unknown}
@@ -180,6 +368,53 @@ check_macos_arm64() {
   kv "ARCH" "$(uname -m)"
   kv "CPU" "$chip"
   kv "THREADS" "$(sysctl -n hw.logicalcpu)"
+}
+
+configure_cpu() {
+  # Reuse the same setting when `all` runs benchmark and mining back-to-back.
+  if [[ -n "$CPU_THREADS" ]]; then
+    return
+  fi
+
+  TOTAL_THREADS="$(sysctl -n hw.logicalcpu)"
+  [[ "$TOTAL_THREADS" =~ ^[0-9]+$ ]] || die "Could not detect logical CPU thread count."
+
+  local requested="$CPU_PERCENT"
+  if [[ -z "$requested" ]]; then
+    echo
+    printf "%bCPU allocation%b
+" "$BOLD" "$RESET"
+    echo "Choose how much CPU Pep Miner should use for this run."
+    echo "Examples: 25 = light, 50 = balanced, 65 = background-friendly, 100 = maximum."
+    echo "This is an approximate cap implemented by limiting active mining threads."
+    read -r -p "CPU usage target [65]: " requested
+    requested="${requested:-65}"
+  fi
+
+  [[ "$requested" =~ ^[0-9]+$ ]] || die "CPU usage must be an integer from 1 to 100."
+  (( requested >= 1 && requested <= 100 )) || die "CPU usage must be between 1 and 100."
+
+  [[ "$NICE_LEVEL" =~ ^[0-9]+$ ]] || die "PEP_NICE_LEVEL must be an integer from 0 to 20."
+  (( NICE_LEVEL >= 0 && NICE_LEVEL <= 20 )) || die "PEP_NICE_LEVEL must be between 0 and 20."
+
+  CPU_PERCENT="$requested"
+
+  # Round to the nearest whole logical thread, then clamp to 1..TOTAL_THREADS.
+  CPU_THREADS=$(( (TOTAL_THREADS * CPU_PERCENT + 50) / 100 ))
+  (( CPU_THREADS < 1 )) && CPU_THREADS=1
+  (( CPU_THREADS > TOTAL_THREADS )) && CPU_THREADS="$TOTAL_THREADS"
+
+  local effective=$(( CPU_THREADS * 100 / TOTAL_THREADS ))
+
+  echo
+  kv "CPU TARGET" "${CPU_PERCENT}%"
+  kv "THREADS" "${CPU_THREADS}/${TOTAL_THREADS} (~${effective}% logical CPU capacity)"
+  kv "PRIORITY" "nice +${NICE_LEVEL} for mining"
+
+  if (( CPU_PERCENT < 100 )); then
+    info "Reduced thread count lowers sustained CPU load, heat, and power draw."
+  fi
+  info "macOS may still show an active mining thread near 100%; the cap is across total logical CPU capacity."
 }
 
 ensure_clt() {
@@ -316,24 +551,27 @@ build_miner() {
 
 benchmark() {
   [[ -x "$MINER" ]] || die "Miner binary not found: $MINER"
+  configure_cpu
 
   echo
   kv "MODE" "benchmark"
   kv "ALGO" "scrypt"
   kv "PARAMS" "N=1024 r=1"
-  kv "THREADS" "$(sysctl -n hw.logicalcpu)"
+  kv "CPU TARGET" "${CPU_PERCENT}%"
+  kv "THREADS" "${CPU_THREADS}/${TOTAL_THREADS}"
   kv "DURATION" "60 seconds"
   echo
 
   "$MINER" \
     -a scrypt \
     --benchmark \
-    -t "$(sysctl -n hw.logicalcpu)" \
+    -t "$CPU_THREADS" \
     --time-limit=60
 }
 
 mine_aikapool() {
   [[ -x "$MINER" ]] || die "Miner binary not found: $MINER"
+  configure_cpu
 
   echo
   echo "============================================================"
@@ -366,7 +604,9 @@ mine_aikapool() {
   kv "WORKER" "$login"
   kv "ALGO" "scrypt N=1024 r=1"
   kv "CPU" "$(detect_chip)"
-  kv "THREADS" "$(sysctl -n hw.logicalcpu)"
+  kv "CPU TARGET" "${CPU_PERCENT}%"
+  kv "THREADS" "${CPU_THREADS}/${TOTAL_THREADS}"
+  kv "PRIORITY" "nice +${NICE_LEVEL}"
   kv "LOG" "$MINE_LOG"
 
   if command -v nc >/dev/null 2>&1; then
@@ -379,20 +619,21 @@ mine_aikapool() {
 
   echo
   echo "Watch for:"
-  echo "  Stratum connection established"
-  echo "  New Stratum Diff"
-  echo "  accepted"
+  echo "  [CONNECT] / [ONLINE]  pool connection status"
+  echo "  [DIFF]               share difficulty updates"
+  echo "  [BLOCK] / [WORK]     incoming new jobs"
+  echo "  [SHARE]              accepted shares"
   echo
   echo "Press Ctrl+C to stop mining."
   echo
 
-  "$MINER" \
+  nice -n "$NICE_LEVEL" "$MINER" \
     -a scrypt \
     -o "stratum+tcp://${POOL_HOST}:${POOL_PORT}" \
     -u "$login" \
     -p "$workerpass" \
-    -t "$(sysctl -n hw.logicalcpu)" \
-    2>&1 | tee -a "$MINE_LOG"
+    -t "$CPU_THREADS" \
+    2>&1 | tee -a "$MINE_LOG" | decorate_miner_output
 }
 
 
@@ -425,13 +666,13 @@ show_menu() {
   printf "%bChoose an action:%b
 
 " "$BOLD" "$RESET"
-  printf "  %b1%b) Full setup -> build -> benchmark -> start PEP mining
+  printf "  %b1%b) Full setup -> build -> choose CPU -> benchmark -> start PEP mining
 " "$GREEN" "$RESET"
   printf "  %b2%b) Install/build only
 " "$GREEN" "$RESET"
-  printf "  %b3%b) Benchmark only
+  printf "  %b3%b) Benchmark only (choose CPU usage)
 " "$GREEN" "$RESET"
-  printf "  %b4%b) Start PEP mining only
+  printf "  %b4%b) Start PEP mining only (choose CPU usage)
 " "$GREEN" "$RESET"
   printf "  %b5%b) Safe Reset (remove local miner build + logs)
 " "$YELLOW" "$RESET"
@@ -510,9 +751,16 @@ Usage:
   $0 mine         Start AikaPool PEP Stratum mining
   $0 reset        Remove local miner build and Pep Miner logs
 
+CPU control:
+  Benchmark and mining ask for a target from 1-100%.
+  The target is implemented by selecting an appropriate number of logical CPU threads.
+  Example on an 8-thread M2: 65% -> 5 mining threads (~62.5% capacity).
+
 Environment overrides:
-  PEP_POOL_HOST   Default: stratum.aikapool.com
-  PEP_POOL_PORT   Default: 7941
+  PEP_POOL_HOST      Default: stratum.aikapool.com
+  PEP_POOL_PORT      Default: 7941
+  PEP_CPU_PERCENT    1-100; skips the interactive CPU prompt
+  PEP_NICE_LEVEL     0-20; default 10 (lower priority for background mining)
 EOF
       ;;
     *)
